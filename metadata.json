@@ -1,0 +1,5 @@
+{
+  "name": "Xiangqi Infinite Scale v0.3.0",
+  "description": "High-performance, O(1) optimized Xiangqi (Chinese Chess) client designed with Data-Oriented architecture and Peer-to-Peer scaling readiness.",
+  "requestFramePermissions": []
+}
