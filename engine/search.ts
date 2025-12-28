@@ -42,6 +42,7 @@ const LMR_TIER_2 = 16;   // Move count for level 3 reduction
 // ---------------------------------------------
 
 const KILLERS = new Int32Array(MAX_PLY * 2);
+// REFACTOR: Static Stack to avoid allocation
 const STACK = new BigUint64Array(8192);
 let stackPointer = 0;
 
@@ -174,6 +175,13 @@ export const assess = (board: Board, turn: Side): number => {
     return quiescence(board, -INF, INF, turn, score, 2000);
 };
 
+// NEW: Exposed Casualty Resolver for Advisor
+export const settle = (board: Board, turn: Side, score: number): number => {
+    // Run quiescence search to resolve all pending captures
+    // This tells us the "True" score after the dust settles.
+    return quiescence(board, -INF, INF, turn, score, 3000);
+};
+
 export const search = (
     board: Board, 
     turn: Side, 
@@ -254,16 +262,8 @@ export const search = (
           break;
       }
 
-      // If we are root splitting, we might not populate the TT fully for 'hint'
-      // But 'bestResult' tracks the local best.
       const move = candidates ? bestResult?.move || 0 : Table.hint(hash);
       const line = candidates ? [move] : trace(board, turn, hash);
-      
-      // Update best result based on the iteration
-      // Note: With candidates, we rely on PVS to return the score of the best candidate
-      // We need to capture the best move from the loop, which PVS logic below does via Table
-      // But if Table is shared/fragmented, we should rely on local tracking?
-      // For now, Table works per-worker.
       
       const bestMoveFromTable = Table.hint(hash);
 
@@ -354,11 +354,11 @@ const pvs = (
 
   if (!isRoot) {
       const repetitions = countRepetition(hash);
-      if (repetitions >= 2) return 0; 
+      if (repetitions >= 2) return 0; // DRAW
   }
 
   PROBES++;
-  // Don't cutoff at Root if we are constrained by candidates (we must search them)
+  
   const cached = Table.load(hash, depth, alpha, beta);
   if (cached !== null && !isRoot && !candidates) {
       HITS++;
@@ -385,8 +385,6 @@ const pvs = (
 
   // ROOT SPLITTING LOGIC
   if (isRoot && candidates) {
-      // Inject candidates into BUFFER
-      // We overwrite the buffer at this pointer because it's the root
       for (let i = 0; i < candidates.length; i++) {
           BUFFER[pointer + i] = candidates[i];
       }

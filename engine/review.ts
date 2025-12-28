@@ -4,7 +4,7 @@ import { generate } from './generate';
 import { commit, revert } from './flow';
 import { BUFFER } from './memory';
 import { threat } from './query';
-import { initial } from './score';
+import { initial, delta } from './score';
 import * as Search from './search';
 
 export interface Hint {
@@ -13,109 +13,91 @@ export interface Hint {
   piece: number;
   kind: 'best' | 'trap' | 'mate' | 'alt';
   score: number;
-  refutation?: { from: number; to: number }; // NEW: The killer reply
+  refutation?: { from: number; to: number }; 
 }
 
 /**
- * @description  Deep Tactical Scanner.
- * @purpose      Prevents blunders by checking the opponent's best reply.
- * @complexity   O(B^2) ~ 1600 nodes.
+ * @description  Deep Tactical Scanner (The Advisor).
+ * @purpose      Prevents blunders by checking the CAUSAL CHAIN of captures.
+ * @algorithm    Iterative Scan + Quiescence Settlement.
+ * @complexity   O(B * Q) where B is branch factor, Q is quiescence complexity.
  */
 export const scan = (board: Board, turn: Side): Hint[] => {
   const hints: Hint[] = [];
-  const enemy = turn === Side.Red ? Side.Black : Side.Red;
+  // const enemy = turn === Side.Red ? Side.Black : Side.Red;
   
-  const offsetA = 0;
-  const endA = generate(board, turn, offsetA);
+  const offset = 0;
+  const end = generate(board, turn, offset);
   
   let bestScore = -Infinity;
   let bestMove = -1;
+  const currentScore = initial(board);
 
-  for (let ptrA = offsetA; ptrA < endA; ptrA++) {
-    const move = BUFFER[ptrA];
+  for (let pointer = offset; pointer < end; pointer++) {
+    const move = BUFFER[pointer];
     const source = move >> 8;
     const target = move & 0xFF;
     const piece = board[source];
-
-    const capA = commit(board, source, target);
+    const captured = commit(board, source, target);
     
     if (threat(board, turn)) {
-      revert(board, source, target, capA);
+      revert(board, source, target, captured);
       continue;
     }
 
-    // --- OPPONENT RESPONSE ANALYSIS ---
-    const offsetB = 500; // Use a safe buffer offset
-    const endB = generate(board, enemy, offsetB);
+    // --- CAUSAL INFERENCE ---
+    // Instead of manually checking one ply, we ask the Engine:
+    // "If I make this move, and the dust settles (Quiescence), what is the score?"
+    // This implicitly handles:
+    // 1. Enemy recaptures (Trade chains)
+    // 2. Hanging pieces
+    // 3. Simple tactical threats
     
-    let worstEnemyResponse = -Infinity; // From opponent perspective, they want to MAX their score
-    let killerMove = 0; 
+    // Calculate immediate score change
+    const change = delta(piece, source, target, captured);
+    const nextScore = currentScore + change;
+    const nextTurn = turn === Side.Red ? Side.Black : Side.Red;
 
-    if (offsetB === endB) {
-        // Opponent has no moves (Stale/Mate)
-        // If we put them in Checkmate, score is MAX.
-        // If Stale (Xiangqi), also MAX (Win).
-        worstEnemyResponse = -20000; // We win, so their response score is terrible for them? No.
-        // Wait, Search.assess returns score from Current Turn perspective.
-        // If it's Enemy turn, assess returns Enemy - Us.
-    } else {
-        // Check opponent's best reply (Quiescence only for speed)
-        for (let ptrB = offsetB; ptrB < endB; ptrB++) {
-            const reply = BUFFER[ptrB];
-            const srcB = reply >> 8;
-            const tgtB = reply & 0xFF;
-            
-            const capB = commit(board, srcB, tgtB);
-            
-            if (threat(board, enemy)) {
-                revert(board, srcB, tgtB, capB);
-                continue;
-            }
+    // Resolve the position (Quiescence Search)
+    // -INF, INF means we want the EXACT outcome, no pruning window.
+    // The result is from the PERSPECTIVE of 'nextTurn' (The Enemy).
+    // So we negate it to get OUR score.
+    const settledScore = -Search.settle(board, nextTurn, nextScore);
 
-            // Evaluate from Enemy's perspective
-            // We use simple quiescence to catch obvious tactical captures
-            const val = Search.assess(board, enemy);
-            
-            if (val > worstEnemyResponse) {
-                worstEnemyResponse = val;
-                killerMove = reply;
-            }
-
-            revert(board, srcB, tgtB, capB);
-        }
-    }
-
-    // Our score is the inverse of opponent's best score
-    const score = -worstEnemyResponse;
-
-    revert(board, source, target, capA);
+    revert(board, source, target, captured);
 
     // Classify Move
     let kind: 'best' | 'trap' | 'mate' | 'alt' = 'alt';
     
-    if (score < -1000) kind = 'trap'; // Losing material
-    if (score < -15000) kind = 'mate'; // Getting mated
+    // If the settled score is much worse than current score, it's a trap (we lost material)
+    if (settledScore < currentScore - 200) kind = 'trap'; 
+    if (settledScore < -20000) kind = 'mate'; 
 
-    if (score > bestScore) {
-        bestScore = score;
+    if (settledScore > bestScore) {
+        bestScore = settledScore;
         bestMove = move;
     }
 
-    // Only suggest interesting moves
-    if (kind === 'trap' || kind === 'mate' || score > bestScore - 150) {
+    // Filter: Only show interesting moves
+    // 1. It's a trap/blunder
+    // 2. It's a mate threat
+    // 3. It's relatively good (close to best move)
+    if (kind === 'trap' || kind === 'mate' || settledScore > bestScore - 100) {
         hints.push({ 
             source, 
             target, 
             piece, 
             kind, 
-            score,
-            refutation: (kind === 'trap' || kind === 'mate') && killerMove !== 0 
-                ? { from: killerMove >> 8, to: killerMove & 0xFF } 
-                : undefined
+            score: settledScore,
+            // Refutation logic is implicit in Quiescence, 
+            // extracting the exact refutation move would require modifying Quiescence to return a PV.
+            // For now, we trust the score drop.
+            refutation: undefined 
         });
     }
   }
 
+  // Mark the absolute best move
   const finalHints = hints.map(h => ({
       ...h,
       kind: h.source === (bestMove >> 8) && h.target === (bestMove & 0xFF) ? 'best' : h.kind
